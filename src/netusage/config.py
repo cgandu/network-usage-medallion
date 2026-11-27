@@ -112,6 +112,8 @@ USER_STATUS_ACTIVE = 1
 # vpn_rules.operational_status codes we generate: 0=NON-OPERATIONAL, 1=OPERATIONAL, 3=SUSPENDED.
 # The pipeline checks only OPERATIONAL; every other code is excluded from the analysis.
 OPERATIONAL_STATUS_ACTIVE = 1
+# traffic_logs.action values: ALLOW / DENY. Silver keeps ALLOW events only.
+ACTION_ALLOW = "ALLOW"
 UNSTABLE_MAX_STATES = 2  # more than this many distinct resolution states...
 UNSTABLE_WINDOW_DAYS = 3  # ...within this rolling window => resource is "Unstable"
 # Resolutions are timestamped; the metric buckets changes by UTC date into windows

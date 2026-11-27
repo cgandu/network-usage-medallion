@@ -17,3 +17,5 @@ landing/
 .vscode/
 .idea/
 .env
+*pyspark-databricks-portfolio-plan.md
+CLAUDE.local.md

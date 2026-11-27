@@ -289,3 +289,11 @@ Until that directory exists, decisions are recorded inline here:
   per-batch row and corrupt counts. See §4.
 - **Email uniqueness:** validated in the generator after lower/strip; silver dedup/quarantine is a
   fallback if real data can collide. See §8.
+- **Flag invalid data, never drop it in a transform:** applies to every layer. Bronze already
+  keeps unparseable rows (`_corrupt_record`). Transforms never filter out invalid rows or remove
+  the source column: a `DataFrame -> DataFrame` transform keeps every row and the original column
+  and adds the parsed columns plus a `<name>_valid` flag (`normalize_ports`: `port_start`,
+  `port_end`, `port_spec_valid`); a `Column -> Column` expression returns `null` for invalid input
+  (`ip_to_long`). The caller (the job building a silver table) decides what happens to flagged
+  rows: drop, quarantine or keep. Business filters (ALLOW only, active users/rules) are not
+  validity checks and stay explicit steps in the table-building transform.
