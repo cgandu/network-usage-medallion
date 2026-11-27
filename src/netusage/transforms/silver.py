@@ -22,6 +22,11 @@ def _as_col(c: Column | str) -> Column:
     return F.col(c) if isinstance(c, str) else c
 
 
+def _is_corrupt() -> Column:
+    """True when Spark could not parse the landing row (its raw text is in ``_corrupt_record``)."""
+    return F.col(CORRUPT_COLUMN).isNotNull()
+
+
 def normalize_ports(df: DataFrame) -> DataFrame:
     """Normalize a raw ``port`` string into integer start/end columns.
 
@@ -199,18 +204,29 @@ def latest_snapshot(bronze: DataFrame) -> DataFrame:
     return latest.select(*bronze.columns)
 
 
-def traffic_events(bronze: DataFrame) -> DataFrame:
+def traffic_events(bronze: DataFrame, all_users: DataFrame) -> DataFrame:
     """Build silver traffic events from a slice of bronze ``traffic_logs``.
 
+    Inputs:
+    - ``bronze``: a slice of bronze ``traffic_logs`` (the rows transformed).
+    - ``all_users``: EVERY user in the directory, active or not, e.g. ``latest_snapshot`` of
+      bronze ``users`` (only ``email`` is used). Not silver ``users``: a disabled user's event
+      comes from a real person, so it is not an unknown user.
+
     Steps, in order:
-    1. Keep ALLOW events only (a business filter, not a validity check).
+    1. Keep ALLOW events only (a business filter, not a validity check). Corrupt rows are kept
+       too: a CSV row with too few fields has null trailing columns, ``action`` included, so
+       the filter alone would drop it silently.
     2. One ``select``: keep every bronze column and add the parsed ones next to their source
        (invalid values become null; the raw string stays so they can be diagnosed).
     3. Flag rows Spark could not parse: ``is_corrupt``. They are kept, not dropped.
     4. Remove duplicate ``event_id`` within this slice, keeping one copy deterministically.
        Duplicates against events already in silver are the MERGE's job, not this function's.
+    5. Flag ``is_unknown_user``: the normalized ``user_email`` matches no user in ``all_users``
+       (normalized with the same ``normalize_email``). Flagged, not dropped. A null email
+       matches nothing, so it is flagged too.
     """
-    allowed = bronze.where(F.col("action") == C.ACTION_ALLOW)
+    allowed = bronze.where((F.col("action") == C.ACTION_ALLOW) | _is_corrupt())
 
     # The parsed value takes the plain name, so the obvious column is the safe one to join on;
     # the bronze value is kept as <name>_raw for diagnosing nulls.
@@ -230,7 +246,7 @@ def traffic_events(bronze: DataFrame) -> DataFrame:
         normalize_protocol("protocol").alias("protocol"),
         "action",
         CORRUPT_COLUMN,
-        F.col(CORRUPT_COLUMN).isNotNull().alias("is_corrupt"),
+        _is_corrupt().alias("is_corrupt"),
         SOURCE_COLUMN,
         BATCH_COLUMN,
         "ingest_ts",
@@ -249,4 +265,303 @@ def traffic_events(bronze: DataFrame) -> DataFrame:
     ranked = parsed.withColumn("_copy", F.row_number().over(first_copy))
     # partitionBy puts every null event_id in ONE group; without the isNull branch, all rows
     # missing an id would collapse into a single row. Keep them all: they are not duplicates.
-    return ranked.where((F.col("_copy") == 1) | F.col("event_id").isNull()).drop("_copy")
+    deduped = ranked.where((F.col("_copy") == 1) | F.col("event_id").isNull()).drop("_copy")
+
+    # Same pattern as is_orphan in group_members: a left join keeps every event and adds a marker
+    # that is null when no user has this email. distinct() prevents fan-out (one email twice in
+    # the directory would otherwise duplicate the event). Join after dedup: fewer rows to join.
+    known_emails = (
+        all_users.select(normalize_email("email").alias("user_email"))
+        .distinct()
+        .withColumn("_user_found", F.lit(True))
+    )
+    flagged = deduped.join(known_emails, "user_email", "left")
+
+    # Joining on a column NAME moves user_email to the front (seen in latest_snapshot), so select
+    # the order explicitly: the data columns, the new flag, then the metadata columns last.
+    metadata = [SOURCE_COLUMN, BATCH_COLUMN, "ingest_ts"]
+    return flagged.select(
+        *[c for c in deduped.columns if c not in metadata],
+        F.col("_user_found").isNull().alias("is_unknown_user"),
+        *metadata,
+    )
+
+
+def users(bronze: DataFrame) -> DataFrame:
+    """Build silver users from bronze ``users`` (all snapshots).
+
+    Steps, in order:
+    1. Keep the latest snapshot only.
+    2. Keep active users (``status == USER_STATUS_ACTIVE``), a business filter. Corrupt rows are
+       kept too: an unparseable JSON line has every column null, including ``status``, so the
+       filter alone would drop it silently. They stay, flagged, for the caller to quarantine.
+    3. One ``select``: email normalized under the plain name (the key the traffic join uses,
+       built with the same ``normalize_email`` as ``traffic_events.user_email``), the bronze value
+       kept as ``email_raw``, and ``is_corrupt`` added.
+
+    Email uniqueness is checked by the generator's validation, not enforced here.
+    """
+    latest = latest_snapshot(bronze)
+    kept = latest.where((F.col("status") == C.USER_STATUS_ACTIVE) | _is_corrupt())
+    return kept.select(
+        "sys_id",
+        F.col("email").alias("email_raw"),
+        normalize_email("email").alias("email"),
+        "department",
+        "site",
+        "status",
+        CORRUPT_COLUMN,
+        _is_corrupt().alias("is_corrupt"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
+
+
+def apps(bronze: DataFrame) -> DataFrame:
+    """Build silver apps from bronze ``apps`` (all snapshots).
+
+    Latest snapshot plus an ``is_corrupt`` flag. No business filter and nothing to normalize:
+    rules reference apps by ``sys_id``, copied as is.
+    """
+    return latest_snapshot(bronze).select(
+        "sys_id",
+        "name",
+        "department",
+        CORRUPT_COLUMN,
+        _is_corrupt().alias("is_corrupt"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
+
+
+def ad_groups(bronze: DataFrame) -> DataFrame:
+    """Build silver AD groups from bronze ``ad_group`` (all snapshots).
+
+    Latest snapshot plus an ``is_corrupt`` flag. ``name`` and ``domain`` are NOT normalized:
+    rules reference a group by the exact ``(name, domain)`` pair, and a name alone is not
+    unique (the same name exists in several domains).
+    """
+    return latest_snapshot(bronze).select(
+        "group_id",
+        "name",
+        "domain",
+        CORRUPT_COLUMN,
+        _is_corrupt().alias("is_corrupt"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
+
+
+def vpn_rules(bronze: DataFrame) -> DataFrame:
+    """Build silver VPN rules from bronze ``vpn_rules`` (all snapshots).
+
+    Steps, in order:
+    1. Keep the latest snapshot only.
+    2. Keep operational rules (``operational_status == OPERATIONAL_STATUS_ACTIVE``), a business
+       filter; corrupt rows are kept, flagged, for the same reason as in ``users``.
+    3. ``normalize_ports`` adds ``port_start``, ``port_end`` and ``port_spec_valid``. Invalid
+       specs are flagged, not dropped.
+    4. One ``select``: bronze ``port`` and ``protocol`` renamed to ``port_raw`` and
+       ``protocol_raw`` (same ``<name>_raw`` convention as ``traffic_events``), protocol
+       normalized under the plain name, ``is_corrupt`` added.
+    """
+    latest = latest_snapshot(bronze)
+    kept = latest.where(
+        (F.col("operational_status") == C.OPERATIONAL_STATUS_ACTIVE) | _is_corrupt()
+    )
+    return normalize_ports(kept).select(
+        "sys_id",
+        "app_sys_id",
+        "gateway",
+        "resource",
+        F.col("port").alias("port_raw"),
+        "port_start",
+        "port_end",
+        "port_spec_valid",
+        F.col("protocol").alias("protocol_raw"),
+        normalize_protocol("protocol").alias("protocol"),
+        "ad_group_name",
+        "ad_group_domain",
+        "operational_status",
+        CORRUPT_COLUMN,
+        _is_corrupt().alias("is_corrupt"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
+
+
+def group_members(memberships: DataFrame, groups: DataFrame, all_users: DataFrame) -> DataFrame:
+    """Build silver group memberships from bronze ``ad_group_membership`` (all snapshots).
+
+    Inputs:
+    - ``memberships``: bronze ``ad_group_membership``, all snapshots (the rows transformed).
+    - ``groups``: silver ``ad_groups``, a lookup (only ``group_id`` is used).
+    - ``all_users``: EVERY user in the directory, active or not, e.g. ``latest_snapshot`` of
+      bronze ``users`` (only ``sys_id`` is used). Not silver ``users``: that table holds active
+      users only, and a disabled user's membership is not an orphan.
+
+    Steps, in order:
+    1. Keep the latest snapshot only.
+    2. Keep user members (``member_type == MEMBER_TYPE_USER``), a business filter; corrupt rows
+       are kept, flagged, as in the other tables.
+    3. Remove duplicate ``(group_id, member_id)`` rows. ``_corrupt_record`` is part of the key,
+       so clean rows are deduped among themselves (it is null for all of them) and a corrupt
+       row never replaces or hides a clean copy.
+    4. Flag ``is_orphan``: the group is not in ``groups`` or the member is not in ``all_users``.
+       Flagged, not dropped: the matching joins skip orphans on their own, and gold can count
+       them.
+    """
+    latest = latest_snapshot(memberships)
+    kept = latest.where((F.col("member_type") == C.MEMBER_TYPE_USER) | _is_corrupt())
+    # dropDuplicates keeps one row per key, but which one is not defined. Fine here: within one
+    # snapshot, copies of a membership can differ only in source_file (a diagnostic column).
+    deduped = kept.dropDuplicates(["group_id", "member_id", CORRUPT_COLUMN])
+
+    # A left join keeps every membership and adds the marker column; no match -> marker is null.
+    # distinct() makes each id appear once on the right: a duplicated key there would multiply
+    # the membership rows (fan-out) instead of just flagging them.
+    known_groups = groups.select("group_id").distinct().withColumn("_group_found", F.lit(True))
+    known_users = (
+        all_users.select(F.col("sys_id").alias("member_id"))
+        .distinct()
+        .withColumn("_member_found", F.lit(True))
+    )
+    flagged = deduped.join(known_groups, "group_id", "left").join(known_users, "member_id", "left")
+
+    is_orphan = F.col("_group_found").isNull() | F.col("_member_found").isNull()
+    return flagged.select(
+        "group_id",
+        "member_id",
+        "group_domain",
+        "member_type",
+        CORRUPT_COLUMN,
+        _is_corrupt().alias("is_corrupt"),
+        is_orphan.alias("is_orphan"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
+
+
+# The largest IPv4 address as an integer (255.255.255.255), the upper bound of ip_to_long.
+IPV4_MAX = 256**4 - 1
+
+
+def resolution_states(bronze: DataFrame) -> DataFrame:
+    """Build silver resolution states from bronze ``resource_resolution`` (all snapshots).
+
+    One row per (resource, state, IP range): a state is the set of IP ranges a resource resolved
+    to during ``[first_seen, last_seen)``; ``last_seen`` NULL means the state is current.
+
+    Steps, in order:
+    1. Keep the latest snapshot only. Each snapshot holds the full history of states.
+    2. Add validity flags; rows are flagged, not dropped:
+       - ``ip_range_valid``: both ends present and ``0 <= ip_start <= ip_end <= IPV4_MAX``.
+       - ``period_valid``: ``first_seen`` present and, unless the state is current,
+         ``first_seen < last_seen`` (half-open: an empty or reversed period can match nothing).
+
+    Parquet is typed, so there is nothing to parse and no ``_corrupt_record``: a file that does
+    not match the schema fails the read instead. Disjointness BETWEEN states of a resource is a
+    property of the whole table, not of a row; ``validation.py`` and the tests check it.
+    """
+    ip_start, ip_end = F.col("ip_start"), F.col("ip_end")
+    first_seen, last_seen = F.col("first_seen"), F.col("last_seen")
+
+    ip_range_valid = F.coalesce(
+        (ip_start >= 0) & (ip_start <= ip_end) & (ip_end <= IPV4_MAX), F.lit(False)
+    )
+    period_valid = F.coalesce(
+        first_seen.isNotNull() & (last_seen.isNull() | (first_seen < last_seen)), F.lit(False)
+    )
+    return latest_snapshot(bronze).select(
+        "resource_name",
+        "state_id",
+        "ip_start",
+        "ip_end",
+        "first_seen",
+        "last_seen",
+        ip_range_valid.alias("ip_range_valid"),
+        period_valid.alias("period_valid"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
+
+
+def rule_access(rules: DataFrame, states: DataFrame) -> DataFrame:
+    """What each rule grants, over time: silver ``vpn_rules`` joined with ``resolution_states``.
+
+    Inputs:
+    - ``rules``: silver ``vpn_rules`` (latest snapshot, operational, ports parsed).
+    - ``states``: silver ``resolution_states``.
+
+    One row per (rule, state, IP range): a rule whose resource resolved to 3 states with 2
+    ranges each gets 6 rows. That multiplication is the point: the matching join (Session 4)
+    looks for the row whose IP range, port range, protocol and period contain an event.
+
+    Nothing is dropped; the flags from both inputs are carried through so matching can choose
+    the usable rows in one place:
+    - ``has_resolution``: false for a rule whose resource has no resolution at all (left join).
+      Such a rule keeps one row with null IP and period columns; it can never be used.
+    - ``port_spec_valid``, ``ip_range_valid``, ``period_valid``, ``is_corrupt``: as in the
+      inputs. The state flags are false (never null) on rows without a resolution.
+    """
+    # Only the columns rule_access needs, renamed where they would be ambiguous after the join
+    # (both tables have source_file, batch_date, ingest_ts; "sys_id" is clearer as rule_sys_id).
+    rule_cols = rules.select(
+        F.col("sys_id").alias("rule_sys_id"),
+        "app_sys_id",
+        "gateway",
+        "resource",
+        "protocol",
+        "port_start",
+        "port_end",
+        "port_spec_valid",
+        "ad_group_name",
+        "ad_group_domain",
+        "is_corrupt",
+    )
+    state_cols = states.select(
+        "resource_name",
+        "state_id",
+        "ip_start",
+        "ip_end",
+        "first_seen",
+        "last_seen",
+        "ip_range_valid",
+        "period_valid",
+    )
+    # The key columns have different names, so join on an expression (both columns are kept;
+    # resource_name is dropped below). A null resource matches nothing and keeps its row.
+    joined = rule_cols.join(
+        state_cols, rule_cols["resource"] == state_cols["resource_name"], "left"
+    )
+
+    # resource_name comes from the states side: it is null exactly when no state matched.
+    has_resolution = F.col("resource_name").isNotNull()
+    return joined.select(
+        "rule_sys_id",
+        "app_sys_id",
+        "gateway",
+        "resource",
+        "protocol",
+        "port_start",
+        "port_end",
+        "ad_group_name",
+        "ad_group_domain",
+        "state_id",
+        "ip_start",
+        "ip_end",
+        "first_seen",
+        "last_seen",
+        has_resolution.alias("has_resolution"),
+        "port_spec_valid",
+        # Unmatched rows get null here from the left join; keep the flags strictly boolean.
+        F.coalesce("ip_range_valid", F.lit(False)).alias("ip_range_valid"),
+        F.coalesce("period_valid", F.lit(False)).alias("period_valid"),
+        "is_corrupt",
+    )

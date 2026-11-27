@@ -1,7 +1,8 @@
 # network-usage-medallion
 
 A medallion-architecture (bronze → silver → gold) pipeline in PySpark for enterprise
-network-access analytics, validated at 100M+ synthetic traffic events on Databricks.
+network-access analytics, designed for 100M+ synthetic traffic events on Databricks
+(full-scale validation pending; so far run on up to 1M events).
 
 > 🚧 Work in progress. All data in this project is synthetic.
 

@@ -198,10 +198,46 @@ flowchart LR
   day. `operationMetrics` reports the logical rewrite (`numCopiedRows`) in both cases; check
   `DESCRIBE DETAIL` (file count, size) for what was physically written. Deleted rows are still
   scanned until `OPTIMIZE` purges them.
-- **Silver:** normalize (email case/whitespace, IP string → integer, port spec → start/end,
-  user-only deduped memberships, latest snapshot of users/apps/rules, resolution states from
-  `first_seen`/`last_seen`), keep only ALLOW events, active users (`USER_STATUS_ACTIVE`) and active
-  rules (`OPERATIONAL_STATUS_ACTIVE`), dedup, MERGE on `event_id`, partition by `event_date`.
+- **Silver:** pure transforms in `netusage.transforms.silver`, one per table. Snapshot tables
+  first keep the newest bronze snapshot (`latest_snapshot`: a semi-join against the broadcast
+  1-row max of `batch_date`, so the plan stays lazy and no `Window` without `partitionBy`).
+
+  | Table (transform) | Inputs | One row per | Business filter | Flags added |
+  |---|---|---|---|---|
+  | `users` | bronze `users` | user | `status = USER_STATUS_ACTIVE` | `is_corrupt` |
+  | `apps` | bronze `apps` | app | – | `is_corrupt` |
+  | `ad_groups` | bronze `ad_group` | group | – | `is_corrupt` |
+  | `vpn_rules` | bronze `vpn_rules` | rule | `operational_status = OPERATIONAL_STATUS_ACTIVE` | `port_spec_valid`, `is_corrupt` |
+  | `group_members` | bronze `ad_group_membership`, silver `ad_groups`, all users | `(group_id, member_id)` | `member_type = MEMBER_TYPE_USER` | `is_corrupt`, `is_orphan` |
+  | `resolution_states` | bronze `resource_resolution` | (resource, state, IP range) | – | `ip_range_valid`, `period_valid` |
+  | `rule_access` | silver `vpn_rules`, silver `resolution_states` | (rule, state, IP range) | – | `has_resolution`; carries `port_spec_valid`, `ip_range_valid`, `period_valid`, `is_corrupt` |
+  | `traffic_events` | bronze `traffic_logs` slice, all users | event (`event_id`) | `action = ACTION_ALLOW` | `is_corrupt`, `is_unknown_user` |
+
+  Conventions shared by every table:
+  - **Parsed value under the plain name, bronze value as `<name>_raw`** (`user_email` /
+    `user_email_raw`, `port_raw`, `protocol_raw`, …): the obvious column is the safe join key.
+    Join keys are normalized on both sides with the same function (`normalize_email`,
+    `normalize_protocol`); group `name`/`domain` are not normalized (exact upstream values).
+  - **Business filters keep corrupt rows:** `filter | is_corrupt`. An unparseable row has null
+    columns, so `status = 1` or `action = 'ALLOW'` alone would drop it silently.
+  - **Flags are strictly boolean** (`coalesce(…, false)`), never null, so `where(~flag)` finds
+    every bad row. Nothing is dropped for being invalid; the caller decides.
+  - **"All users" for `is_orphan` and `is_unknown_user`:** every user in the latest snapshot,
+    any status. A disabled user exists; only matching and gold restrict to active users (silver
+    `users`). On TINY data, using active users only would flag 292 orphans instead of 10 and
+    588 unknown-user events instead of 55.
+  - **Dedup:** `traffic_events` ranks copies of an `event_id` explicitly (clean first, then
+    earliest batch, then file), so a re-run keeps the same copy. `group_members` uses
+    `dropDuplicates` on `(group_id, member_id, _corrupt_record)`: within one snapshot the
+    copies are identical, and the corrupt-record key keeps clean and corrupt copies apart.
+  - Metadata columns (`source_file`, `batch_date`, `ingest_ts`) stay last; `rule_access` is
+    derived from two tables and carries none.
+
+  `rule_access` multiplies rows on purpose (every state and range of a rule's resource); it is
+  the input of the matching join. Lookups (`ad_groups`, all users) are made `distinct()` before
+  a left join so they can only flag rows, never multiply them.
+  **Not built yet (Session 5):** the silver job writing these tables, `MERGE` on `event_id`
+  across batches, partitioning by `event_date`, `pipeline_runs`.
 - **Matching:** each log ↔ every rule whose resolved IP range contains the destination IP
   **at the event's instant**, whose port range contains the port, same protocol, and whose group
   contains the user. Resolution validity is instant-granular with UTC half-open intervals
@@ -261,6 +297,15 @@ flowchart LR
   not check); corrupt rows counted exactly from Delta with no cache; on TINY data, bronze matches
   landing, a full re-run leaves every table and the audit unchanged, and a daily run replaces only
   its day.
+- Silver unit tests (`tests/test_silver.py`): every expression and table transform on tiny
+  hand-built DataFrames, including ANSI breakers, corrupt rows with all-null columns, fan-out
+  guards and exact column order; plus one test per table on TINY landing data (with bronze
+  metadata added in memory) checking counts and that exactly the planted dirty rows are flagged.
+- Silver integration (`tests/test_silver_integration.py`): the real bronze job writes Delta
+  twice (backfill + daily run, so two snapshots), then every silver table is built in job order.
+  Checks: newest snapshot only, every bronze day present, join-key types between silver tables
+  (the columns the matching join compares), foreign keys on clean rows, flags wired with all
+  users, and a rebuild from the same bronze gives identical tables.
 - Pipeline checks: late-event placement. **TBD:** where these live.
 
 ## 9. Decisions
@@ -297,3 +342,15 @@ Until that directory exists, decisions are recorded inline here:
   (`ip_to_long`). The caller (the job building a silver table) decides what happens to flagged
   rows: drop, quarantine or keep. Business filters (ALLOW only, active users/rules) are not
   validity checks and stay explicit steps in the table-building transform.
+- **Silver latest snapshot:** semi-join against the broadcast 1-row `max(batch_date)` instead of
+  `collect()` (an action inside a transform) or an unpartitioned `Window` (all rows in one
+  partition). Costs a second scan of the snapshot table. See §4.
+- **Silver naming:** parsed value under the plain name, bronze value as `<name>_raw`; applies to
+  `vpn_rules` too (`port_raw`, `protocol_raw`). See §4.
+- **Business filters keep corrupt rows** (`filter | is_corrupt`) in `users`, `vpn_rules`,
+  `group_members` and `traffic_events`. See §4.
+- **Orphan memberships and unknown users are flagged, not dropped,** against all users of any
+  status; "inactive" is a business filter applied later, "unknown" is a data-quality fact.
+  See §4.
+- **`rule_access` keeps rules without a resolution** (`has_resolution = false`) and carries the
+  validity flags uncombined: the matching join decides in one place which rows are usable.

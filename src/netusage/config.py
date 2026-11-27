@@ -112,6 +112,8 @@ USER_STATUS_ACTIVE = 1
 # vpn_rules.operational_status codes we generate: 0=NON-OPERATIONAL, 1=OPERATIONAL, 3=SUSPENDED.
 # The pipeline checks only OPERATIONAL; every other code is excluded from the analysis.
 OPERATIONAL_STATUS_ACTIVE = 1
+# ad_group_membership.member_type: silver keeps user members only (others are computers etc.).
+MEMBER_TYPE_USER = "user"
 # traffic_logs.action values: ALLOW / DENY. Silver keeps ALLOW events only.
 ACTION_ALLOW = "ALLOW"
 UNSTABLE_MAX_STATES = 2  # more than this many distinct resolution states...
